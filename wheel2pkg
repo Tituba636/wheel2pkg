@@ -167,6 +167,37 @@ def wheelReadFile(archive, filename):
 
 	return (foundPath, raw)
 
+
+def tarballReadFile(archive, filename):
+	try:
+		import tarfile
+
+		tf = tarfile.open(archive)
+	except Exception as err:
+		log_fatal("Unable to open tar archive %s: %s" % (archive, err))
+
+	searchName = "/" + filename
+	foundPath = None
+	for name in tf.getnames():
+		if name.endswith(searchName):
+			foundPath = name
+			break
+
+	if foundPath is None:
+		log_fatal("Unable to locate %s file in %s" % (filename, archive))
+
+	try:
+		log_info("Reading file %s (from %s)" % (foundPath, archive))
+		raw = tf.extractfile(foundPath)
+	except Exception as err:
+		log_fatal("Unable to extract %s from wheel archive %s: %s" % (foundPath, archive, err))
+
+	if raw is None:
+		log_fatal("Unable to extract %s from wheel archive %s: no data?" % (foundPath, archive))
+
+	return (foundPath, raw)
+
+
 def lstripAndChop(s, chars):
 	pfxLen = 0
 	for i in range(len(s)):
@@ -245,15 +276,86 @@ def parseRequirement(req):
 
 	return req + comment
 
-def parseWheelMetadata(archive, path, raw):
-	simpleAttrs = ("name", "version", "license", "summary", "home-page", "author", "author-email", "platform")
-	listAttrs = ("python-versions", "requires")
+PythonPkg_simpleAttrs = ("name", "version", "license", "summary", "home-page", "author", "author-email", "platform")
+PythonPkg_listAttrs = ("python-versions", "requires")
 
-	result = dict()
-	for a in simpleAttrs:
-		result[a] = None
-	for a in listAttrs:
-		result[a] = []
+def newMetadata():
+	global PythonPkg_simpleAttrs, PythonPkg_listAttrs
+
+	meta = dict()
+	for a in PythonPkg_simpleAttrs:
+		meta[a] = None
+	for a in PythonPkg_listAttrs:
+		meta[a] = []
+
+	return meta
+
+def processPythonPackageAttr(result, kwd, value):
+	global PythonPkg_simpleAttrs, PythonPkg_listAttrs
+
+	if kwd == "license" and value.lower() == "unknown":
+		return
+
+	if kwd in PythonPkg_simpleAttrs:
+		result[kwd] = value
+		return
+
+	if kwd == "requires-dist":
+		info = parseRequirement(value)
+		if info is not None:
+			result['requires'].append(info)
+		return
+
+	if kwd == "classifier":
+		info = value.replace(" ", "")
+		if info == "ProgrammingLanguage::Python":
+			# ignore
+			return
+
+		if info.startswith("ProgrammingLanguage::Python::"):
+			info = info.replace("ProgrammingLanguage::Python::", "", 1)
+			if info[0].isdigit():
+				global Global_Python2Version, Global_Python3Version
+
+				# This is either "$MAJOR" or "$MAJOR.$MINOR"
+				pyvers = None
+				if info == "2" or info == Global_Python2Version:
+					pyvers = "python2"
+				elif info == "3" or info == Global_Python3Version:
+					pyvers = "python3"
+
+				if pyvers and pyvers not in result['python-versions']:
+					result['python-versions'].append(pyvers)
+			return
+
+		if info.startswith("License::OSIApproved::") and \
+		   result['license'] is None:
+			info = info.replace("License::OSIApproved::", "", 1)
+			result['license'] = info
+			return
+
+		# We don't care about these; but we also don't want to clutter
+		# our output
+		if info.startswith("Impl") or \
+		   info.startswith("NaturalLanguage") or \
+		   info.startswith("DevelopmentStatus") or \
+		   info.startswith("Environment") or \
+		   info.startswith("IntendedAudience"):
+			# ignore
+			return
+
+		log_verbose("  ignoring classifier=%s" % value)
+		return
+
+	if kwd == 'requires-python':
+		log_verbose("We should really handle this requires-python info")
+
+	log_verbose("  ignoring %s=%s" % (kwd, value))
+
+def parseWheelMetadata(archive, path, raw):
+	global PythonPkg_simpleAttrs, PythonPkg_listAttrs
+
+	result = newMetadata()
 
 	log_info("Parsing %s" % (path))
 	for line in raw.decode().splitlines():
@@ -270,66 +372,303 @@ def parseWheelMetadata(archive, path, raw):
 				log_warning("%s: unexpected metadata version %s" % (archive, value))
 			continue
 
-		if kwd == "license" and value.lower() == "unknown":
-			continue
-
-		if kwd in simpleAttrs:
-			result[kwd] = value
-			continue
-
-		if kwd == "requires-dist":
-			info = parseRequirement(value)
-			if info is not None:
-				result['requires'].append(info)
-			continue
-
-		if kwd == "classifier":
-			info = value.replace(" ", "")
-			if info == "ProgrammingLanguage::Python":
-				# ignore
-				continue
-
-			if info.startswith("ProgrammingLanguage::Python::"):
-				info = info.replace("ProgrammingLanguage::Python::", "", 1)
-				if info[0].isdigit():
-					global Global_Python2Version, Global_Python3Version
-
-					# This is either "$MAJOR" or "$MAJOR.$MINOR"
-					pyvers = None
-					if info == "2" or info == Global_Python2Version:
-						pyvers = "python2"
-					elif info == "3" or info == Global_Python3Version:
-						pyvers = "python3"
-
-					if pyvers and pyvers not in result['python-versions']:
-						result['python-versions'].append(pyvers)
-				continue
-
-			if info.startswith("License::OSIApproved::") and \
-			   result['license'] is None:
-				info = info.replace("License::OSIApproved::", "", 1)
-				result['license'] = info
-				continue
-
-			# We don't care about these; but we also don't want to clutter
-			# our output
-			if info.startswith("Impl") or \
-			   info.startswith("NaturalLanguage") or \
-			   info.startswith("DevelopmentStatus") or \
-			   info.startswith("Environment") or \
-			   info.startswith("IntendedAudience"):
-				# ignore
-				continue
-
-			log_verbose("  ignoring classifier=%s" % value)
-			continue
-
-		if kwd == 'requires-python':
-			log_verbose("We should really handle this requires-python info")
-
-		log_verbose("  ignoring %s=%s" % (kwd, value))
+		processPythonPackageAttr(result, kwd, value)
 
 	return result
+
+class Tokenizer:
+	EOF = None
+	PUNCT = 1
+	STRING = 2
+	IDENTIFIER = 3
+	OTHER = 42
+
+	def __init__(self, str, file = None, filename = None):
+		self.__stashed = ()
+
+		self.__s = str
+		self.__f = file
+		self.__i = 0
+		self.__c = None
+		self.filename = filename
+
+	def error(self, msg):
+		if self.filename:
+			msg = "%s: %s" % (self.filename, msg)
+		raise ValueError(msg)
+
+	def unget(self, token, value):
+		if self.__stashed:
+			log_fatal("Tokeninzer.unget() called twice in a row")
+		self.__stashed = (token, value)
+
+	def next(self, eofAllowed = False):
+		(token, value) = self.__next()
+
+		# print("  (%d, %s)" % (token, value))
+		if token is None and not eofAllowed:
+			self.error("unexpected End of File")
+
+		return (token, value)
+
+	def __next(self):
+		if self.__stashed:
+			rv = self.__stashed
+			self.__stashed = ()
+			return rv
+
+		while True:
+			c = self.__getc()
+			if c is None:
+				return (None, None)
+			if not c.isspace():
+				break
+
+		if c in "()[]{},=:;/*+-$":
+			return (Tokenizer.PUNCT, c)
+
+		if c == "'" or c == '"':
+			return (Tokenizer.STRING, self.__stringLiteral(c))
+
+		if c.isalpha():
+			ident = c
+			while True:
+				c = self.__getc()
+				if c is None:
+					break
+
+				if not c.isalnum() and c != "_":
+					self.__ungetc(c)
+					break
+
+				ident += c
+
+			return (Tokenizer.IDENTIFIER, ident)
+
+		return (Tokenizer.OTHER, c)
+
+	def __stringLiteral(self, end):
+		result = ""
+		while True:
+			c = self.__getc()
+			if c == '\\':
+				c = self.__getc()
+				if c is None:
+					log_fatal("new line in the middle of a string")
+				result += c
+				continue
+
+			if c == end:
+				break
+
+			result += c
+
+		return result
+
+	def __ungetc(self, c):
+		if self.__c is not None:
+			log_fatal("Tokeninzer cannot look ahead more than one")
+
+		self.__c = c
+
+	def __getc(self):
+		c = self.__c
+		if c is not None:
+			self.__c = None
+			return c
+
+		while True:
+			s = self.__s
+			i = self.__i
+
+			if s is None:
+				return None
+
+			if i < len(s):
+				break
+
+			self.__gets()
+			# print("new line: %s" % self.__s)
+
+		# print("s[%d] = %s" % (i, s[i]))
+		self.__i += 1
+		return s[i]
+
+	def __gets(self):
+		self.__s = None
+		self.__i = 0
+
+		f = self.__f
+		if f is not None:
+			while self.__s is None:
+				s = f.readline()
+				if not s:
+					self.__f = None
+					return
+
+				self.__s = s.decode().rstrip("\n")
+				break
+
+def parseTuple(tokenizer, end):
+	result = []
+
+	token = None
+	while True:
+		(token, value) = tokenizer.next()
+		if token == Tokenizer.PUNCT and value == end:
+			return result
+
+		tokenizer.unget(token, value)
+		item = parseLiteral(tokenizer)
+		result.append(item)
+
+		(token, value) = tokenizer.next()
+		if token == Tokenizer.PUNCT and value == ',':
+			continue
+		tokenizer.unget(token, value)
+
+def parseDict(tokenizer, end):
+	result = {}
+
+	token = None
+	while True:
+		(token, value) = tokenizer.next()
+		if token == Tokenizer.PUNCT and value == end:
+			return result
+
+		if token != Tokenizer.STRING:
+			tokenizer.error("items in a dict must start with 'string'")
+		key = value
+
+		(token, value) = tokenizer.next()
+		if token != Tokenizer.PUNCT or value != ':':
+			tokenizer.error("items in a dict must start with 'string' : ")
+
+		value = parseLiteral(tokenizer)
+		result[key] = value
+
+		(token, value) = tokenizer.next()
+		if token == Tokenizer.PUNCT and value == ',':
+			continue
+		tokenizer.unget(token, value)
+
+def parseLiteral(tokenizer):
+	(token, value) = tokenizer.next()
+	if token == Tokenizer.STRING:
+		return value
+
+	if token == Tokenizer.IDENTIFIER:
+		return "unknown"
+
+	if token == Tokenizer.PUNCT and value == '[':
+		return parseTuple(tokenizer, ']')
+	if token == Tokenizer.PUNCT and value == '(':
+		return parseTuple(tokenizer, ')')
+	if token == Tokenizer.PUNCT and value == '{':
+		return parseDict(tokenizer, '}')
+
+	tokenizer.error("Unable to handle literal starting with %s" % value)
+
+def parseSetupPy(archive, path, raw):
+	PythonPkg_simpleAttrs = ("name", "version", "license", "summary", "home-page", "author", "author-email", "platform")
+	PythonPkg_listAttrs = ("python-versions", "requires")
+
+	result = dict()
+	for a in PythonPkg_simpleAttrs:
+		result[a] = None
+	for a in PythonPkg_listAttrs:
+		result[a] = []
+
+	log_info("Parsing %s" % (path))
+
+	found = False
+	while True:
+		line = raw.readline()
+		if line is None:
+			break
+
+		line = line.decode().strip()
+		if not line.startswith("setup"):
+			continue
+
+		log_verbose("Found line starting with setup")
+		tokenizer = Tokenizer(line[5:], raw, filename = path)
+
+		(token, value) = tokenizer.next()
+		if token != Tokenizer.PUNCT or value != '(':
+			tokenizer.error("setup.py: 'setup' not followed by '('")
+
+		log_verbose("  Parse setup arg list")
+		NEXT_ITEM = 1
+		AFTER_ITEM_IDENTIFER = 2
+
+		paramIndex = 0
+		while True:
+			log_verbose("  Next argument")
+
+			(token, value) = tokenizer.next()
+
+			if token == Tokenizer.PUNCT and value == ')':
+				# we've made it!
+				log_verbose("  Parsed last argument")
+				return result
+
+			paramIndex += 1
+			if token == Tokenizer.STRING:
+				log_warning("setup.py: unnamed positional parameter at position %d; ignored" % paramIndex)
+			elif token == Tokenizer.IDENTIFIER:
+				keyword = value
+
+				(token, value) = tokenizer.next()
+				if token == Tokenizer.PUNCT:
+					if value == ',':
+						log_warning("setup.py: unnamed positional parameter at position %d; ignored" % paramIndex)
+						continue
+
+					if value == '=':
+						literal = parseLiteral(tokenizer)
+						log_verbose("    %s = %s" % (keyword, literal))
+
+						metaKeywordMapping = {
+							'url'		: 'home-page',
+							'author_email'	: 'author-email',
+							'description'	: 'summary',
+							'classifiers'	: 'classifier',
+						}
+
+						mapped = metaKeywordMapping.get(keyword)
+						if mapped is not None:
+							keyword = mapped
+
+						if type(literal) == list:
+							for item in literal:
+								processPythonPackageAttr(result, keyword, item)
+						elif type(literal) == dict:
+							pass
+						else:
+							processPythonPackageAttr(result, keyword, literal)
+					else:
+						tokenizer.error("unexpected token %s" % value)
+				else:
+					tokenizer.error("unexpected token %s" % value)
+
+			(token, value) = tokenizer.next()
+			if token == Tokenizer.PUNCT:
+				if value == ')':
+					# we've made it!
+					return result
+
+				if value == ',':
+					# one more
+					continue
+
+				tokenizer.error("unexpected token %s" % value)
+
+
+		found = True
+
+	log_fatal("Unable to locate setup() call in %s" % path)
+
 
 # Return SPDX short Identifier for license
 Global_SpdxIds = {
@@ -680,10 +1019,13 @@ def obsBuildRequirements(pyvers, requires):
 def obsCreatePackage(pipName):
 
 	print("=== Creating OBS package from %s wheel ===" % pipName)
+	pkgName = pipName
 
 	runShellCommand("pip download --no-deps %s" % pipName)
 
 	l = findFiles(pipName + "-", ".whl")
+	if not l:
+		l = findFiles(pipName + "-", ".tar.gz")
 	if not l:
 		log_fatal("Cannot find downloaded wheel archive")
 
@@ -692,16 +1034,27 @@ def obsCreatePackage(pipName):
 		log_fatal("Found more than one wheel archive; don't know how to proceed")
 
 	wheelArchive = l[0]
-	wheelArchiveBase = wheelArchive[:-4]
+	if wheelArchive.endswith(".whl"):
+		wheelArchiveBase = wheelArchive[:-4]
 
-	(whlBasename, whlVersion, whlCompatPy, whlCompatApi, whlCompatPlatform) = wheelArchiveBase.split("-")
-	if whlBasename != pipName:
-		log_warning("downloaded archive name %s does not match request name %s" % (whlBasename, pipName))
-	pkgName = whlBasename
+		(whlBasename, whlVersion, whlCompatPy, whlCompatApi, whlCompatPlatform) = wheelArchiveBase.split("-")
+		if whlBasename != pipName:
+			log_warning("downloaded archive name %s does not match request name %s" % (whlBasename, pipName))
 
-	(path_METADATA, raw) = wheelReadFile(wheelArchive, "METADATA")
+		(path_METADATA, raw) = wheelReadFile(wheelArchive, "METADATA")
+		metadata = parseWheelMetadata(wheelArchive, path_METADATA, raw)
+	elif wheelArchive.endswith(".tar.gz"):
+		wheelArchiveBase = wheelArchive[:-7]
 
-	metadata = parseWheelMetadata(wheelArchive, path_METADATA, raw)
+		(whlBasename, whlVersion) = wheelArchiveBase.split("-")
+		if whlBasename != pipName:
+			log_warning("downloaded archive name %s does not match request name %s" % (whlBasename, pipName))
+
+		(path_setup, raw) = tarballReadFile(wheelArchive, "setup.py")
+		metadata = parseSetupPy(wheelArchive, path_setup, raw)
+	else:
+		log_fatal("Don't know how to process archive %s" % wheelArchive)
+
 
 	massageMetadata(pkgName, metadata)
 
