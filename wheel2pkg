@@ -157,15 +157,93 @@ def wheelReadFile(archive, filename):
 			break
 
 	if foundPath is None:
-		fatalError("Unable to locate %s file in %s" % (filename, archive))
+		log_fatal("Unable to locate %s file in %s" % (filename, archive))
 
 	try:
 		log_info("Reading file %s (from %s)" % (foundPath, archive))
 		raw = zf.read(foundPath)
 	except err:
-		fatalError("Unable to extract %s from wheel archive %s: %s" % (foundPath, archive, err))
+		log_fatal("Unable to extract %s from wheel archive %s: %s" % (foundPath, archive, err))
 
 	return (foundPath, raw)
+
+def lstripAndChop(s, chars):
+	pfxLen = 0
+	for i in range(len(s)):
+		if s[i] not in chars:
+			break
+		pfxLen = i + 1
+
+	prefix = s[:pfxLen]
+	rest = s[pfxLen:].strip()
+
+	return (prefix, rest)
+
+# Full syntax of requirements is specified in PEP508
+def parseVersionSpec(req, name, versionSpec):
+	log_verbose("  %s|%s" % (name, versionSpec))
+
+	if versionSpec.find(",") >= 0:
+		result = []
+		for part in versionSpec.split(","):
+			result.append(parseVersionSpec(req, name, part))
+
+		return ", ".join(result)
+
+	rpmVersionOperators = {
+		"==" : "=",
+		"<=" : "<=",
+		">=" : ">=",
+		"<"  : "<",
+		">"  : ">",
+		"~=" : "=",	# fudge it
+		"===" : "=",	# fudge it
+	}
+
+	(op, version) = lstripAndChop(versionSpec, "<>=~")
+
+	rpmOp = rpmVersionOperators.get(op)
+	if rpmOp is not None:
+		version = version.strip()
+		# We do not prefix with python- or python3- here, as we do not
+		# know the context yet. This needs to happen later
+		return "%s %s %s" % (name, rpmOp, version)
+
+	log_fatal("Unable to handle requirement %s %s" % (req, versionSpec))
+
+def parseRequirement(req):
+	import re
+
+	log_verbose("parsing requirement \"%s\"" % req)
+	comment = ""
+
+	# environment markers
+	if ";" in req:
+		(req, envReq) = req.split(";", 1)
+
+		envReq = envReq.strip()
+
+		(ident, rest) = lstripAndChop(envReq, "abcdefghijklmnopqrstuvwxyz")
+		rest = rest.strip()
+
+		if ident == "extra" and rest.startswith("=="):
+			log_info("Ignorning requirement \"%s\" due to env marker \"%s\"" % (req, envReq))
+			return
+
+		# For now, we just leave the env marker in a comment
+		# requiring manual cleanup
+		comment = " # " + envReq
+
+	req = req.strip()
+
+	m = re.search("\((.*)\)$", req)
+	if m is not None:
+		name = req[:m.start(0)].strip()
+		versionSpec = m.group(1)
+
+		return parseVersionSpec(req, name, versionSpec) + comment
+
+	return req + comment
 
 def parseWheelMetadata(archive, path, raw):
 	simpleAttrs = ("name", "version", "license", "summary", "home-page", "author", "author-email", "platform")
@@ -192,13 +270,17 @@ def parseWheelMetadata(archive, path, raw):
 				log_warning("%s: unexpected metadata version %s" % (archive, value))
 			continue
 
+		if kwd == "license" and value.lower() == "unknown":
+			continue
+
 		if kwd in simpleAttrs:
 			result[kwd] = value
 			continue
 
 		if kwd == "requires-dist":
-			info = value.replace(" ", "")
-			result['requires'].append(info)
+			info = parseRequirement(value)
+			if info is not None:
+				result['requires'].append(info)
 			continue
 
 		if kwd == "classifier":
@@ -241,6 +323,9 @@ def parseWheelMetadata(archive, path, raw):
 
 			log_verbose("  ignoring classifier=%s" % value)
 			continue
+
+		if kwd == 'requires-python':
+			log_verbose("We should really handle this requires-python info")
 
 		log_verbose("  ignoring %s=%s" % (kwd, value))
 
@@ -293,6 +378,11 @@ def massageMetadata(pkgName, meta):
 
 	if meta['home-page'] is not None:
 		meta['url'] = meta['home-page']
+
+	if meta['summary'] is not None:
+		# our rpmlint considers a summary that ends in a '.' an error.
+		# would you believe it.
+		meta['summary'] = meta['summary'].rstrip('.')
 
 def walkTree(root):
 	import os
@@ -386,6 +476,9 @@ def pipInstall(pipName, pythonVersion = None):
 
 	ignoreFilesWithSuffix(addedFiles, ".pyc")
 	ignoreFilesMatching(addedFiles, lambda name : "/__pycache__/" in name)
+
+	# ignore the typeshed gunk in jedi and others.
+	ignoreFilesMatching(addedFiles, lambda name : "/third_party/" in name)
 
 	return addedFiles
 
@@ -488,12 +581,12 @@ tar -C usr -xjf %{S:0}
 %changelog
 """
 
-def obsCreateSpecfile(pkgDir, specFileName, binaryPkgName, archiveName, manifestName, metadata):
+def obsCreateSpecfile(pkgDir, specFileName, binaryPkgName, archiveName, manifestName, pyRequires, metadata):
 	global Specfile_Template
 	import re, os
 
 	requires = []
-	for req in metadata['requires']:
+	for req in pyRequires:
 		requires.append("Requires:               %s" % req)
 
 	specfilePath = "%s/%s" % (pkgDir, specFileName)
@@ -571,6 +664,18 @@ def obsCreateChangesFile(pkgDir, binaryPkgName, pkgVersion):
 	else:
 		log_info("A .changes file for %s exists; do not forget to update as needed")
 
+def obsBuildRequirements(pyvers, requires):
+	global Global_PkgPrefix
+
+	result = []
+
+	prefix = Global_PkgPrefix[pyvers]
+	for req in requires:
+		if not req.startswith("python"):
+			req = "%s-%s" % (prefix, req)
+		result.append(req)
+
+	return result
 
 def obsCreatePackage(pipName):
 
@@ -603,6 +708,8 @@ def obsCreatePackage(pipName):
 	if not metadata['python-versions']:
 		log_fatal("%s: unable to infer supported python versions from metadata" % pipName)
 
+	log_info("%s supports %s" % (pipName, ", ".join(metadata['python-versions'])))
+
 	pkgDir = obsCreatePkgDirectory(pkgName)
 
 	pkgVersion = metadata['version']
@@ -625,7 +732,10 @@ def obsCreatePackage(pipName):
 			     ]
 		manifestName = obsCreateManifest(pkgDir, binaryPkgName, pkgVersion, extraFiles + files)
 
-		specFilePath = obsCreateSpecfile(pkgDir, specfileName, binaryPkgName, archiveName, manifestName, metadata)
+		specFilePath = obsCreateSpecfile(pkgDir, specfileName, binaryPkgName,
+			       archiveName, manifestName,
+			       obsBuildRequirements(pyvers, metadata['requires']),
+			       metadata)
 
 		obsCreateChangesFile(pkgDir, binaryPkgName, pkgVersion)
 
