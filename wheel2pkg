@@ -1,0 +1,638 @@
+#!/usr/bin/python3
+
+import os
+
+Global_Python2Version = "2.7"
+Global_Python3Version = "3.4"
+
+Global_PythonVersion = {
+	"python2" : "2.7",
+	"python3" : "3.4",
+}
+Global_PkgPrefix = {
+	"source"  : "python",
+	"python2" : "python",
+	"python3" : "python3",
+}
+
+# Set this if you want all your OBS package directories
+# in /work/ibs/wheels or something
+Global_SrcPkgRoot = None
+
+Global_BuildRoot = "/var/tmp/build-$USER"
+Global_InstallRoot = "/usr"
+
+opt_verbose = False
+
+def usage():
+	print("wheel2pkg [options] name [...]")
+	print("  options can be one of")
+	print("    -h, --help   Display this message")
+
+
+def abort(exitCode = 2):
+	import sys
+
+	print ("Aborting package conversion")
+	sys.exit(exitCode)
+
+def fatalError(msg):
+	print ("Error: " + msg)
+	abort()
+
+def error(msg):
+	print ("Error: " + msg)
+
+def log_warning(msg):
+	print ("Warning: " + msg)
+
+def log_info(msg):
+	print ("== " + msg)
+
+def log_verbose(msg):
+	global opt_verbose
+
+	if opt_verbose:
+		log_info(msg)
+
+def shellExpansion(value):
+
+	if "$" not in value:
+		return value
+
+	result = ""
+	while True:
+		i = value.find("$")
+		if i < 0:
+			break
+
+		result += value[:i]
+		value = value[i+1:]
+
+		if value[0] == "$":
+			result += "$"
+			value = value[1:]
+			continue
+
+		varlen = 0
+		for j in range(len(value)):
+			if not value[j].isalpha():
+				break
+			varlen = j + 1
+
+		varname = value[:varlen]
+		value = value[varlen:]
+
+		expansion = os.getenv(varname)
+
+		if expansion is not None:
+			result += expansion
+
+	return result + value
+
+def runShellCommand(cmd):
+	import os
+
+	log_info("Executing shell command <<%s>>" % cmd)
+	rv = os.system(cmd)
+	if rv != 0:
+		error("Shell command returned exit status %d - failed" % rv)
+		abort()
+
+def runShellCommandList(cmdList):
+	return runShellCommand("; ".join(cmdList))
+
+def findFiles(basename, suffix = None):
+	import os
+
+	result = []
+	for d in os.listdir("."):
+		if d.startswith(basename) and \
+		   (suffix is None or d.endswith(suffix)):
+			result.append(d)
+	
+	return result
+
+def ignoreFilesMatching(fileList, testFunc):
+	i = 0
+	while i < len(fileList):
+		if testFunc(fileList[i]):
+			log_info("Ignoring file \"%s\"" % fileList[i])
+			del fileList[i]
+		else:
+		 	i += 1
+
+def ignoreFilesWithSuffix(fileList, suffix):
+	ignoreFilesMatching(fileList, lambda name : name.endswith(suffix))
+
+def writeFileList(path, fileList, makeRelative = False):
+	f = open(path, 'w')
+	for name in fileList:
+		if not name.endswith("/"):
+			if makeRelative and name.startswith("/"):
+				f.write(".%s\n" % name)
+			else:
+				f.write("%s\n" % name)
+	f.close()
+
+def removeFile(path):
+	import os
+
+	os.remove(path)
+
+def wheelReadFile(archive, filename):
+	try:
+		import zipfile
+		zf = zipfile.ZipFile(archive)
+
+		zf.testzip()
+	except err:
+		fatalError("Unable to open wheel archive %s: %s" % (archive, err))
+
+	searchName = "/" + filename
+	foundPath = None
+	for name in zf.namelist():
+		if name.endswith(searchName):
+			foundPath = name
+			break
+
+	if foundPath is None:
+		fatalError("Unable to locate %s file in %s" % (filename, archive))
+
+	try:
+		log_info("Reading file %s (from %s)" % (foundPath, archive))
+		raw = zf.read(foundPath)
+	except err:
+		fatalError("Unable to extract %s from wheel archive %s: %s" % (foundPath, archive, err))
+
+	return (foundPath, raw)
+
+def parseWheelMetadata(archive, path, raw):
+	simpleAttrs = ("name", "version", "license", "summary", "home-page", "author", "author-email", "platform")
+	listAttrs = ("python-versions", "requires")
+
+	result = dict()
+	for a in simpleAttrs:
+		result[a] = None
+	for a in listAttrs:
+		result[a] = []
+
+	log_info("Parsing %s" % (path))
+	for line in raw.decode().splitlines():
+		if not line or not line[0].isalpha():
+			break
+
+		(kwd, value) = line.split(':', 1)
+
+		kwd = kwd.lower()
+		value = value.strip()
+
+		if kwd == "metadata-version":
+			if value not in ('2.0', '2.1'):
+				log_warning("%s: unexpected metadata version %s" % (archive, value))
+			continue
+
+		if kwd in simpleAttrs:
+			result[kwd] = value
+			continue
+
+		if kwd == "requires-dist":
+			info = value.replace(" ", "")
+			result['requires'].append(info)
+			continue
+
+		if kwd == "classifier":
+			info = value.replace(" ", "")
+			if info == "ProgrammingLanguage::Python":
+				# ignore
+				continue
+
+			if info.startswith("ProgrammingLanguage::Python::"):
+				info = info.replace("ProgrammingLanguage::Python::", "", 1)
+				if info[0].isdigit():
+					global Global_Python2Version, Global_Python3Version
+
+					# This is either "$MAJOR" or "$MAJOR.$MINOR"
+					pyvers = None
+					if info == "2" or info == Global_Python2Version:
+						pyvers = "python2"
+					elif info == "3" or info == Global_Python3Version:
+						pyvers = "python3"
+
+					if pyvers and pyvers not in result['python-versions']:
+						result['python-versions'].append(pyvers)
+				continue
+
+			if info.startswith("License::OSIApproved::"):
+				info = info.replace("License::OSIApproved::", "", 1)
+				result['license'] = info
+				continue
+
+			# We don't care about these; but we also don't want to clutter
+			# our output
+			if info.startswith("Impl") or \
+			   info.startswith("NaturalLanguage") or \
+			   info.startswith("DevelopmentStatus") or \
+			   info.startswith("Environment") or \
+			   info.startswith("IntendedAudience"):
+				# ignore
+				continue
+
+			log_verbose("  ignoring classifier=%s" % value)
+			continue
+
+		log_verbose("  ignoring %s=%s" % (kwd, value))
+
+	return result
+
+def translateLicense(name):
+	# To be done
+	log_warning("Unknown license string \"%s\"" % name)
+	return name
+
+def massageMetadata(pkgName, meta):
+	def warnMissingAttr(attrName):
+		log_warning("%s metadata lacks a %s attribute" % (pkgName, attrName))
+
+	if meta['name'] is None:
+		warnMissingAttr("Name")
+		meta['name'] = pkgName
+	elif meta['name'] != pkgName:
+		log_warning("%s metadata specifies a conflicting package name (%s)" % (pkgName, meta['name']))
+		meta['name'] = pkgName
+
+	if meta['license'] is None:
+		warnMissingAttr("License")
+		meta['license'] = "Unknown"
+	else:
+		meta['license'] = translateLicense(meta['license'])
+
+	if meta['home-page'] is not None:
+		meta['url'] = meta['home-page']
+
+def walkTree(root):
+	import os
+
+	# log_verbose("walkTree(%s)" % root)
+	rootLen = len(root)
+
+	result = []
+	for base, dirs, files in os.walk(root):
+		if base.startswith(root):
+			base = base[rootLen:]
+		result += ((os.path.join(base, name) + "/") for name in dirs)
+		result += (os.path.join(base, name) for name in files)
+
+	return sorted(result)
+
+def compareTrees(tree1, tree2):
+	global opt_verbose
+
+	added = []
+	removed = []
+
+	index1 = 0
+	index2 = 0
+	len1 = len(tree1)
+	len2 = len(tree2)
+
+	while True:
+		if index1 >= len1:
+			added += tree2[index2:]
+			break
+
+		if index2 >= len2:
+			removed += tree1[index1:]
+			break
+
+		name1 = tree1[index1]
+		name2 = tree2[index2]
+
+		if name1 == name2:
+			index1 += 1
+			index2 += 1
+		elif name1 < name2:
+			removed.append(name1)
+			index1 += 1
+		else:
+			added.append(name2)
+			index2 += 1
+
+	if opt_verbose:
+		if removed:
+			print("Removed:");
+			print("\n".join(removed))
+		if added:
+			print("Added:");
+			print(",\n".join(added))
+
+	return (removed, added)
+
+def pipInstall(pipName, pythonVersion = None):
+	global Global_BuildRoot
+
+	log_info("Install wheel %s (%s)" % (pipName, pythonVersion))
+
+	runShellCommand("rm -rf %s" % Global_BuildRoot)
+	if pythonVersion is not None:
+		runShellCommand("virtualenv --python %s --clear %s" % (pythonVersion, Global_BuildRoot))
+	else:
+		runShellCommand("virtualenv --clear %s" % Global_BuildRoot)
+
+	treeBefore = walkTree(Global_BuildRoot)
+
+	runShellCommandList((
+			". %s/bin/activate" % Global_BuildRoot,
+			"pip --disable-pip-version-check install --no-deps %s" % pipName
+			))
+
+	treeAfter = walkTree(Global_BuildRoot)
+
+	log_info("Comparing tree contents before and adter pip install")
+	(removedFiles, addedFiles) = compareTrees(treeBefore, treeAfter)
+
+	if removedFiles:
+		error("Installation of %s for %s removed one or more files:" % (pipName, pythonVersion))
+		error("\n".join(removedFiles))
+		fatalError("Cannot deal with removed files")
+
+	if not addedFiles:
+		error("Installation of %s for %s did not install any files" % (pipName, pythonVersion))
+		fatalError("Unable to create %s package" % pythonVersion)
+
+	ignoreFilesWithSuffix(addedFiles, ".pyc")
+	ignoreFilesMatching(addedFiles, lambda name : "/__pycache__/" in name)
+
+	return addedFiles
+
+def obsCreatePkgDirectory(pkgName):
+	global Global_SrcPkgRoot, Global_PkgPrefix
+	import os
+
+	prefix = Global_PkgPrefix['source']
+	if prefix:
+		prefix += "-"
+
+	if Global_SrcPkgRoot is None:
+		pkgDirectory = "%s%s" % (prefix, pkgName)
+	else:
+		pkgDirectory = "%s/%s%s" % (Global_SrcPkgRoot, prefix, pkgName)
+
+	if os.path.exists(pkgDirectory):
+		if not os.path.isdir(pkgDirectory):
+			fatalError("%s exists, but is not a directory" % pkgDirectory)
+
+		for pyvers in Global_PkgPrefix.keys():
+			if pyvers == "source":
+				continue
+
+			specfilePath = "%s/%s-%s.spec" % (pkgDirectory, Global_PkgPrefix[pyvers], pkgName)
+			if os.path.exists(specfilePath):
+				log_warning("%s exists and seems to contain a spec file for %s - proceed with caution" % (pkgDirectory, pyvers))
+	else:
+		os.makedirs(pkgDirectory)
+
+	log_info("OBS package will be prepared in %s" % pkgDirectory)
+	return pkgDirectory
+
+def obsCreateArchive(pkgDir, pkgName, pkgVersion, files):
+	global Global_BuildRoot
+
+	archiveName = "%s/%s-%s.tar.bz2" % (pkgDir, pkgName, pkgVersion)
+
+	writeFileList("FILES", files, makeRelative = True)
+
+	log_info("Creating archive file %s" % archiveName)
+	runShellCommand("tar -C %s -T FILES --owner root --group root -cvjf %s" % (
+				Global_BuildRoot, archiveName
+				))
+
+	removeFile("FILES")
+
+	return archiveName
+
+def obsCreateManifest(pkgDir, pkgName, pkgVersion, files):
+	global Global_InstallRoot
+
+	manifestName = "%s.files" % pkgName
+	manifestPath = "%s/%s" % (pkgDir, manifestName)
+
+	fullpathFiles = (("/usr" + name) for name in files)
+
+	f = open(manifestPath, 'w')
+	for name in files:
+		name = Global_InstallRoot + name
+
+		if name.endswith("/"):
+			f.write("%%dir %s\n" % name)
+		else:
+			f.write("%%attr(-,root,root) %s\n" % name)
+	f.close()
+
+	return manifestName
+
+
+Specfile_Template = """
+Name:			@@PKG_NAME_BINARY@@
+Version:		@@PKG_VERSION@@
+Release:		0
+URL:			@@PKG_URL@@
+Summary:		Python: @@PKG_SUMMARY@@
+License:		@@PKG_LICENSE@@
+Group:			Development/Languages/Python
+@@PKG_REQUIRES@@
+
+BuildArch:		noarch
+
+Source:			@@PKG_ARCHIVE@@
+Source1:		@@PKG_MANIFEST@@
+
+%description
+@@PKG_DESCRIPTION@@
+
+%prep
+%build
+
+%install
+cd $RPM_BUILD_ROOT || exit 1
+mkdir -p usr
+tar -C usr -xjf %{S:0}
+
+%files -f %{S:1}
+%defattr(-,root,root)
+
+%changelog
+"""
+
+def obsCreateSpecfile(pkgDir, specFileName, binaryPkgName, archiveName, manifestName, metadata):
+	global Specfile_Template
+	import re, os
+
+	requires = []
+	for req in metadata['requires']:
+		requires.append("Requires:               %s" % req)
+
+	specfilePath = "%s/%s" % (pkgDir, specFileName)
+	specf = open(specfilePath, "w")
+
+	rx = re.compile("@@PKG_([^@]*)@@")
+	for line in Specfile_Template.splitlines():
+		outline = ""
+		while True:
+			m = rx.search(line)
+			if m is None:
+				outline += line
+				break
+
+			outline += line[:m.start(0)]
+			line = line[m.end(0):]
+
+			key = m.group(1).lower()
+
+			if key == "archive":
+				value = os.path.basename(archiveName)
+			elif key == "manifest":
+				value = os.path.basename(manifestName)
+			elif key == "requires":
+				value = "\n".join(requires)
+			elif key == "description":
+				value = metadata.get('summary')
+				if not value:
+					value = "Automatically repackaged %s wheel" % metadata['name']
+				author = metadata.get('author')
+				if author:
+					value += "\n\nAuthor: " + author
+					email = metadata.get('author-email')
+					if email:
+						value += " (" + email + ")"
+			elif key == "name_binary":
+				value = binaryPkgName
+			else:
+				try:
+					value = metadata[key]
+				except:
+					fatalError("Unable to build spec file; cannot find pkg_%s" % key)
+
+			outline += value
+
+
+		specf.write(outline + "\n")
+
+	specf.close()
+
+	log_info("Wrote specfile to %s" % specfilePath)
+	return specfilePath
+
+def obsCreateChangesFile(pkgDir, binaryPkgName, pkgVersion):
+	import os
+
+	changesFilePath = "%s/%s.changes" % (pkgDir, binaryPkgName)
+	if not os.path.exists(changesFilePath):
+		import time, os
+
+		f = open(changesFilePath, "w")
+		f.write("-" * 67 + "\n")
+
+		user = os.getenv("USER")
+		if not user:
+			user = "unknown"
+
+		timestamp = time.strftime("%a %b %2d %H:%M:%S UTC %Y", time.gmtime())
+
+		f.write("%s - %s@suse.de\n\n" % (timestamp, user))
+		f.write(" - Initial packaging (version %s)\n" % pkgVersion)
+		f.close()
+
+		log_info("Created %s" % changesFilePath)
+	else:
+		log_info("A .changes file for %s exists; do not forget to update as needed")
+
+
+def obsCreatePackage(pipName):
+
+	print("=== Creating OBS package from %s wheel ===" % pipName)
+
+	runShellCommand("pip download --no-deps %s" % pipName)
+
+	l = findFiles(pipName + "-", ".whl")
+	if not l:
+		fatalError("Cannot find downloaded wheel archive")
+
+	if len(l) > 1:
+		error("Found archive files: %s" % ", ".join(l))
+		fatalError("Found more than one wheel archive; don't know how to proceed")
+
+	wheelArchive = l[0]
+	wheelArchiveBase = wheelArchive[:-4]
+
+	(whlBasename, whlVersion, whlCompatPy, whlCompatApi, whlCompatPlatform) = wheelArchiveBase.split("-")
+	if whlBasename != pipName:
+		log_warning("downloaded archive name %s does not match request name %s" % (whlBasename, pipName))
+	pkgName = whlBasename
+
+	(path_METADATA, raw) = wheelReadFile(wheelArchive, "METADATA")
+
+	metadata = parseWheelMetadata(wheelArchive, path_METADATA, raw)
+
+	massageMetadata(pkgName, metadata)
+
+	if not metadata['python-versions']:
+		fatalError("%s: unable to infer supported python versions from metadata" % pipName)
+
+	pkgDir = obsCreatePkgDirectory(pkgName)
+
+	pkgVersion = metadata['version']
+	for pyvers in metadata['python-versions']:
+		global Global_PkgPrefix, Global_PythonVersion
+
+		files = pipInstall(pkgName, pyvers)
+
+		pkgPrefix = Global_PkgPrefix[pyvers]
+		binaryPkgName = "%s-%s" % (pkgPrefix, pkgName)
+		specfileName = "%s.spec" % binaryPkgName
+
+		archiveName = obsCreateArchive(pkgDir, binaryPkgName, pkgVersion, files)
+
+		# rpmlint wants these to be called out explicitly in the rpm %files list
+		v = Global_PythonVersion[pyvers]
+		extraFiles = [
+			"/lib/python%s/" % v,
+			"/lib/python%s/site-packages/" % v,
+			     ]
+		manifestName = obsCreateManifest(pkgDir, binaryPkgName, pkgVersion, extraFiles + files)
+
+		specFilePath = obsCreateSpecfile(pkgDir, specfileName, binaryPkgName, archiveName, manifestName, metadata)
+
+		obsCreateChangesFile(pkgDir, binaryPkgName, pkgVersion)
+
+	log_info("Done.")
+
+def main():
+	import sys, getopt
+	global opt_verbose
+	global Global_BuildRoot
+
+	try:
+		opts, args = getopt.getopt(sys.argv[1:], "hv", ["help", "verbose"])
+	except getopt.GetoptError as err:
+		# print help information and exit:
+		print (str(err))
+		usage()
+		sys.exit(2)
+
+	for o, a in opts:
+		if o in ("-h", "--help"):
+			usage()
+			sys.exit()
+		if o in ("-v", "--verbose"):
+			opt_verbose = True
+
+	Global_BuildRoot = shellExpansion(Global_BuildRoot)
+	log_verbose("Build root is %s" % Global_BuildRoot)
+
+	for name in args:
+		obsCreatePackage(name)
+
+
+if __name__ == "__main__":
+	main()

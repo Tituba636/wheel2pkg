@@ -1,0 +1,33 @@
+
+Name:			@@PKG_NAME@@
+Version:		@@PKG_VERSION@@
+Release:		0
+URL:			@@PKG_URL@@
+Summary:		Python: @@PKG_SUMMARY@@
+License:		@@PKG_LICENSE@@
+Group:			Development/Languages/Python
+@@PKG_REQUIRES@@
+
+BuildArch:		noarch
+
+Source:			@@PKG_ARCHIVE@@
+Source1:		@@PKG_MANIFEST@@
+
+%description
+@@PKG_DESCRIPTION@@
+
+%prep
+%build
+
+%install
+cd $RPM_BUILD_ROOT || exit 1
+mkdir -p usr
+tar -C usr -xjf %{S:0}
+
+%files -f %{S:1}
+%defattr(-,root,root)
+%dir /usr/lib/python2.7
+%dir /usr/lib/python2.7/site-packages
+%dir /usr/lib/python2.7/site-packages/@@PKG_SHORT_NAME@@-@@PKG_VERSION@@.dist-info
+
+%changelog
