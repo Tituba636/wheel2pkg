@@ -223,7 +223,8 @@ def parseWheelMetadata(archive, path, raw):
 						result['python-versions'].append(pyvers)
 				continue
 
-			if info.startswith("License::OSIApproved::"):
+			if info.startswith("License::OSIApproved::") and \
+			   result['license'] is None:
 				info = info.replace("License::OSIApproved::", "", 1)
 				result['license'] = info
 				continue
@@ -245,9 +246,32 @@ def parseWheelMetadata(archive, path, raw):
 
 	return result
 
-def translateLicense(name):
-	# To be done
-	log_warning("Unknown license string \"%s\"" % name)
+# Return SPDX short Identifier for license
+Global_SpdxIds = {
+	'MIT'			: 'MIT',
+	'MITLicense'		: 'MIT',
+	'ApacheLicense2.0'	: 'Apache-2.0',
+	'ISCLicense'		: 'ISC',
+	'ISClicense'		: 'ISC',
+	'ISCLicense(ISCL)'	: 'ISC',
+	'PythonSoftwareFoundationLicense' : 'Python-2.0',
+	'PSF'			: 'Python-2.0',
+}
+
+def translateLicense(pkgName, name):
+	# Some wheels refer to rather generic license names such as BSD. Help the poor struggler
+	if pkgName == 'ipython':
+		return "BSD-3-Clause"
+	if pkgName == 'decorator':
+		return "BSD-2-Clause"
+	if pkgName == 'Pygments':
+		return "BSD-2-Clause"
+
+	spdxID = Global_SpdxIds.get(name.replace(' ', ''))
+	if spdxID:
+		return spdxID
+
+	log_info("Unknown license string \"%s\"" % name)
 	return name
 
 def massageMetadata(pkgName, meta):
@@ -265,7 +289,7 @@ def massageMetadata(pkgName, meta):
 		warnMissingAttr("License")
 		meta['license'] = "Unknown"
 	else:
-		meta['license'] = translateLicense(meta['license'])
+		meta['license'] = translateLicense(pkgName, meta['license'])
 
 	if meta['home-page'] is not None:
 		meta['url'] = meta['home-page']
