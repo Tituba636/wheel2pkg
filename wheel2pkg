@@ -36,11 +36,11 @@ def abort(exitCode = 2):
 	print ("Aborting package conversion")
 	sys.exit(exitCode)
 
-def fatalError(msg):
+def log_fatal(msg):
 	print ("Error: " + msg)
 	abort()
 
-def error(msg):
+def log_error(msg):
 	print ("Error: " + msg)
 
 def log_warning(msg):
@@ -96,7 +96,7 @@ def runShellCommand(cmd):
 	log_info("Executing shell command <<%s>>" % cmd)
 	rv = os.system(cmd)
 	if rv != 0:
-		error("Shell command returned exit status %d - failed" % rv)
+		log_error("Shell command returned exit status %d - failed" % rv)
 		abort()
 
 def runShellCommandList(cmdList):
@@ -147,7 +147,7 @@ def wheelReadFile(archive, filename):
 
 		zf.testzip()
 	except err:
-		fatalError("Unable to open wheel archive %s: %s" % (archive, err))
+		log_fatal("Unable to open wheel archive %s: %s" % (archive, err))
 
 	searchName = "/" + filename
 	foundPath = None
@@ -352,13 +352,13 @@ def pipInstall(pipName, pythonVersion = None):
 	(removedFiles, addedFiles) = compareTrees(treeBefore, treeAfter)
 
 	if removedFiles:
-		error("Installation of %s for %s removed one or more files:" % (pipName, pythonVersion))
-		error("\n".join(removedFiles))
-		fatalError("Cannot deal with removed files")
+		log_error("Installation of %s for %s removed one or more files:" % (pipName, pythonVersion))
+		log_error("\n".join(removedFiles))
+		log_fatal("Cannot deal with removed files")
 
 	if not addedFiles:
-		error("Installation of %s for %s did not install any files" % (pipName, pythonVersion))
-		fatalError("Unable to create %s package" % pythonVersion)
+		log_error("Installation of %s for %s did not install any files" % (pipName, pythonVersion))
+		log_fatal("Unable to create %s package" % pythonVersion)
 
 	ignoreFilesWithSuffix(addedFiles, ".pyc")
 	ignoreFilesMatching(addedFiles, lambda name : "/__pycache__/" in name)
@@ -380,7 +380,7 @@ def obsCreatePkgDirectory(pkgName):
 
 	if os.path.exists(pkgDirectory):
 		if not os.path.isdir(pkgDirectory):
-			fatalError("%s exists, but is not a directory" % pkgDirectory)
+			log_fatal("%s exists, but is not a directory" % pkgDirectory)
 
 		for pyvers in Global_PkgPrefix.keys():
 			if pyvers == "source":
@@ -511,7 +511,7 @@ def obsCreateSpecfile(pkgDir, specFileName, binaryPkgName, archiveName, manifest
 				try:
 					value = metadata[key]
 				except:
-					fatalError("Unable to build spec file; cannot find pkg_%s" % key)
+					log_fatal("Unable to build spec file; cannot find pkg_%s" % key)
 
 			outline += value
 
@@ -556,11 +556,11 @@ def obsCreatePackage(pipName):
 
 	l = findFiles(pipName + "-", ".whl")
 	if not l:
-		fatalError("Cannot find downloaded wheel archive")
+		log_fatal("Cannot find downloaded wheel archive")
 
 	if len(l) > 1:
-		error("Found archive files: %s" % ", ".join(l))
-		fatalError("Found more than one wheel archive; don't know how to proceed")
+		log_error("Found archive files: %s" % ", ".join(l))
+		log_fatal("Found more than one wheel archive; don't know how to proceed")
 
 	wheelArchive = l[0]
 	wheelArchiveBase = wheelArchive[:-4]
@@ -577,7 +577,7 @@ def obsCreatePackage(pipName):
 	massageMetadata(pkgName, metadata)
 
 	if not metadata['python-versions']:
-		fatalError("%s: unable to infer supported python versions from metadata" % pipName)
+		log_fatal("%s: unable to infer supported python versions from metadata" % pipName)
 
 	pkgDir = obsCreatePkgDirectory(pkgName)
 
