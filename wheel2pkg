@@ -22,7 +22,7 @@ Global_SrcPkgRoot = None
 Global_BuildRoot = "/var/tmp/build-$USER"
 Global_InstallRoot = "/usr"
 
-opt_verbose = False
+opt_verbose = 0
 
 def usage():
 	print("wheel2pkg [options] name [...]")
@@ -53,6 +53,12 @@ def log_verbose(msg):
 	global opt_verbose
 
 	if opt_verbose:
+		log_info(msg)
+
+def log_debug(msg):
+	global opt_verbose
+
+	if opt_verbose > 1:
 		log_info(msg)
 
 def shellExpansion(value):
@@ -381,9 +387,10 @@ class Tokenizer:
 	PUNCT = 1
 	STRING = 2
 	IDENTIFIER = 3
+	NUMBER = 4
 	OTHER = 42
 
-	def __init__(self, str, file = None, filename = None):
+	def __init__(self, str, file = None, filename = None, lineno = 1):
 		self.__stashed = ()
 
 		self.__s = str
@@ -391,11 +398,17 @@ class Tokenizer:
 		self.__i = 0
 		self.__c = None
 		self.filename = filename
+		self.line = lineno
 
 	def error(self, msg):
 		if self.filename:
-			msg = "%s: %s" % (self.filename, msg)
+			msg = "%s(%d): %s" % (self.filename, self.line, msg)
 		raise ValueError(msg)
+
+	def warning(self, msg):
+		if self.filename:
+			msg = "%s(%d): %s" % (self.filename, self.line, msg)
+		log_warning(msg)
 
 	def unget(self, token, value):
 		if self.__stashed:
@@ -405,11 +418,32 @@ class Tokenizer:
 	def next(self, eofAllowed = False):
 		(token, value) = self.__next()
 
-		# print("  (%d, %s)" % (token, value))
+		log_debug("  (%s, %s)" % (token, value))
 		if token is None and not eofAllowed:
 			self.error("unexpected End of File")
 
 		return (token, value)
+
+	def peek(self):
+		if not self.__stashed:
+			(t, v) = self.next(eofAllowed = True)
+			if t is None:
+				return (t, v)
+			self.__stashed = (t, v)
+		return self.__stashed
+
+	def lookahead(self, expectToken, expectValue):
+		(token, value) = self.peek()
+		if token is None:
+			return False
+
+		if token != expectToken:
+			return False
+
+		if expectValue and value != expectValue:
+			return False
+
+		return True
 
 	def __next(self):
 		if self.__stashed:
@@ -424,11 +458,26 @@ class Tokenizer:
 			if not c.isspace():
 				break
 
-		if c in "()[]{},=:;/*+-$":
+		if c in "()[]{},=:;/*+-$%":
 			return (Tokenizer.PUNCT, c)
 
 		if c == "'" or c == '"':
 			return (Tokenizer.STRING, self.__stringLiteral(c))
+
+		if c.isdigit():
+			number = c
+			while True:
+				c = self.__getc()
+				if c is None:
+					break
+
+				if not c.isdigit() and c != ".":
+					self.__ungetc(c)
+					break
+
+				number += c
+
+			return (Tokenizer.NUMBER, number)
 
 		if c.isalpha():
 			ident = c
@@ -437,7 +486,7 @@ class Tokenizer:
 				if c is None:
 					break
 
-				if not c.isalnum() and c != "_":
+				if not c.isalnum() and c != "_" and c != ".":
 					self.__ungetc(c)
 					break
 
@@ -507,6 +556,7 @@ class Tokenizer:
 					return
 
 				self.__s = s.decode().rstrip("\n")
+				self.line += 1
 				break
 
 def parseTuple(tokenizer, end):
@@ -519,7 +569,7 @@ def parseTuple(tokenizer, end):
 			return result
 
 		tokenizer.unget(token, value)
-		item = parseLiteral(tokenizer)
+		item = parseExpression(tokenizer)
 		result.append(item)
 
 		(token, value) = tokenizer.next()
@@ -544,7 +594,7 @@ def parseDict(tokenizer, end):
 		if token != Tokenizer.PUNCT or value != ':':
 			tokenizer.error("items in a dict must start with 'string' : ")
 
-		value = parseLiteral(tokenizer)
+		value = parseExpression(tokenizer)
 		result[key] = value
 
 		(token, value) = tokenizer.next()
@@ -552,13 +602,30 @@ def parseDict(tokenizer, end):
 			continue
 		tokenizer.unget(token, value)
 
-def parseLiteral(tokenizer):
+def parseLiteral(tokenizer, globalVariableDict = None):
 	(token, value) = tokenizer.next()
 	if token == Tokenizer.STRING:
 		return value
 
 	if token == Tokenizer.IDENTIFIER:
-		return "unknown"
+		identifier = value
+
+		if tokenizer.lookahead(Tokenizer.PUNCT, '('):
+			tokenizer.next() # consume
+			# debug0("handling function call")
+			parseArgumentList(tokenizer, globalVariableDict, indent = "    ")
+			return "unknown"
+
+		value = None
+		if globalVariableDict:
+			value = globalVariableDict.get(identifier)
+		if value is None:
+			value = "unknown"
+
+		return value
+
+	if token == Tokenizer.NUMBER:
+		return value
 
 	if token == Tokenizer.PUNCT and value == '[':
 		return parseTuple(tokenizer, ']')
@@ -569,103 +636,166 @@ def parseLiteral(tokenizer):
 
 	tokenizer.error("Unable to handle literal starting with %s" % value)
 
+def parseExpression(tokenizer, globalVariableDict = None):
+	# print("parseExpression: parse left literal")
+	literal = parseLiteral(tokenizer, globalVariableDict)
+	# print("parseExpression: parsed %s" % literal)
+
+	while True:
+		(token, value) = tokenizer.peek()
+	# print("parseExpression: next is (%s, %s)" % (token, value))
+
+		# Do we have an infix operator?
+		if token != Tokenizer.PUNCT or value not in "%+-*/":
+			break
+
+		tokenizer.next() # consume operator
+		# print("Expression: parse right hand side")
+		parseExpression(tokenizer)
+
+		# Anything more complex than a literal always
+		# returns None
+		literal = None
+
+	# print("parseExpression: return %s" % literal)
+	return literal
+
+def parseArgumentList(tokenizer, globalVariableDict = None, indent = "  "):
+	def debug0(msg):
+		log_verbose(indent + msg)
+
+	def debug1(msg):
+		log_debug(indent + msg)
+
+	positionalArgs = []
+	namedArgs = {}
+
+	paramIndex = 0
+	while True:
+		debug0("Next argument")
+
+		(token, value) = tokenizer.next()
+
+		if token == Tokenizer.PUNCT and value == ')':
+			# we've made it!
+			debug0("Parsed last argument")
+			return (positionalArgs, namedArgs)
+
+		paramIndex += 1
+		if token == Tokenizer.STRING:
+			tokenizer.warning("unnamed positional parameter at position %d; ignored" % paramIndex)
+			positionalArgs.append(value)
+		elif token == Tokenizer.IDENTIFIER:
+			keyword = value
+
+			(token, value) = tokenizer.next()
+			if token == Tokenizer.PUNCT:
+				if value == ',':
+					tokenizer.warning("unnamed positional parameter at position %d; ignored" % paramIndex)
+					positionalArgs.append(keyword)
+					continue
+
+				if value == '=':
+					literal = parseExpression(tokenizer, globalVariableDict)
+					debug0("  %s = %s" % (keyword, literal))
+					namedArgs[keyword] = literal
+				elif value == '(':
+					debug0("handling function call")
+					parseArgumentList(tokenizer, globalVariableDict, literal + "  ")
+				else:
+					break
+			else:
+				break
+		else:
+			break
+
+		(token, value) = tokenizer.next()
+		if token == Tokenizer.PUNCT:
+			if value == ')':
+				# we've made it!
+				return (positionalArgs, namedArgs)
+
+			if value == ',':
+				# one more
+				continue
+
+		break
+
+	tokenizer.error("unexpected token %s" % value)
+
+def tryParseSimpleAssignment(variableDict, line):
+	try:
+		tokenizer = Tokenizer(line)
+
+		(token, value) = tokenizer.next()
+		if token != Tokenizer.IDENTIFIER:
+			return
+		name = value
+
+		if not tokenizer.lookahead(Tokenizer.PUNCT, "="):
+			return False
+		tokenizer.next() # consume
+	
+		rhs = parseExpression(tokenizer)
+		if rhs is not None:
+			log_debug("  Found global variable assignment %s=%s" % (name, rhs))
+			variableDict[name] = rhs
+	except:
+		return
+
 def parseSetupPy(archive, path, raw):
-	PythonPkg_simpleAttrs = ("name", "version", "license", "summary", "home-page", "author", "author-email", "platform")
-	PythonPkg_listAttrs = ("python-versions", "requires")
-
-	result = dict()
-	for a in PythonPkg_simpleAttrs:
-		result[a] = None
-	for a in PythonPkg_listAttrs:
-		result[a] = []
-
 	log_info("Parsing %s" % (path))
+	result = newMetadata()
 
-	found = False
+	globalVariables = dict()
+
+	lineno = 0
 	while True:
 		line = raw.readline()
 		if line is None:
 			break
+		lineno += 1
 
 		line = line.decode().strip()
+
 		if not line.startswith("setup"):
+			if line and line[0].isalpha():
+				tryParseSimpleAssignment(globalVariables, line)
 			continue
 
 		log_verbose("Found line starting with setup")
-		tokenizer = Tokenizer(line[5:], raw, filename = path)
+		tokenizer = Tokenizer(line[5:], raw, filename = path, lineno = lineno)
 
 		(token, value) = tokenizer.next()
 		if token != Tokenizer.PUNCT or value != '(':
 			tokenizer.error("setup.py: 'setup' not followed by '('")
 
 		log_verbose("  Parse setup arg list")
-		NEXT_ITEM = 1
-		AFTER_ITEM_IDENTIFER = 2
+		(positionalArgs, namedArgs) = parseArgumentList(tokenizer, globalVariables)
 
-		paramIndex = 0
-		while True:
-			log_verbose("  Next argument")
+		for keyword in namedArgs:
+			metaKeywordMapping = {
+				'url'		: 'home-page',
+				'author_email'	: 'author-email',
+				'description'	: 'summary',
+				'classifiers'	: 'classifier',
+			}
 
-			(token, value) = tokenizer.next()
+			literal = namedArgs[keyword]
 
-			if token == Tokenizer.PUNCT and value == ')':
-				# we've made it!
-				log_verbose("  Parsed last argument")
-				return result
+			mapped = metaKeywordMapping.get(keyword)
+			if mapped is not None:
+				keyword = mapped
 
-			paramIndex += 1
-			if token == Tokenizer.STRING:
-				log_warning("setup.py: unnamed positional parameter at position %d; ignored" % paramIndex)
-			elif token == Tokenizer.IDENTIFIER:
-				keyword = value
+			if type(literal) == list:
+				for item in literal:
+					processPythonPackageAttr(result, keyword, item)
+			elif type(literal) == dict:
+				pass
+			else:
+				processPythonPackageAttr(result, keyword, literal)
 
-				(token, value) = tokenizer.next()
-				if token == Tokenizer.PUNCT:
-					if value == ',':
-						log_warning("setup.py: unnamed positional parameter at position %d; ignored" % paramIndex)
-						continue
-
-					if value == '=':
-						literal = parseLiteral(tokenizer)
-						log_verbose("    %s = %s" % (keyword, literal))
-
-						metaKeywordMapping = {
-							'url'		: 'home-page',
-							'author_email'	: 'author-email',
-							'description'	: 'summary',
-							'classifiers'	: 'classifier',
-						}
-
-						mapped = metaKeywordMapping.get(keyword)
-						if mapped is not None:
-							keyword = mapped
-
-						if type(literal) == list:
-							for item in literal:
-								processPythonPackageAttr(result, keyword, item)
-						elif type(literal) == dict:
-							pass
-						else:
-							processPythonPackageAttr(result, keyword, literal)
-					else:
-						tokenizer.error("unexpected token %s" % value)
-				else:
-					tokenizer.error("unexpected token %s" % value)
-
-			(token, value) = tokenizer.next()
-			if token == Tokenizer.PUNCT:
-				if value == ')':
-					# we've made it!
-					return result
-
-				if value == ',':
-					# one more
-					continue
-
-				tokenizer.error("unexpected token %s" % value)
-
-
-		found = True
+		return result
 
 	log_fatal("Unable to locate setup() call in %s" % path)
 
@@ -1112,7 +1242,7 @@ def main():
 			usage()
 			sys.exit()
 		if o in ("-v", "--verbose"):
-			opt_verbose = True
+			opt_verbose += 1
 
 	Global_BuildRoot = shellExpansion(Global_BuildRoot)
 	log_verbose("Build root is %s" % Global_BuildRoot)
