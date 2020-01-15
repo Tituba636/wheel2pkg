@@ -863,8 +863,8 @@ def walkTree(root):
 	for base, dirs, files in os.walk(root):
 		if base.startswith(root):
 			base = base[rootLen:]
-		result += ((os.path.join(base, name) + "/") for name in dirs)
-		result += (os.path.join(base, name) for name in files)
+		result += ((base + "/" + name + "/") for name in dirs)
+		result += ((base + "/" + name) for name in files)
 
 	return sorted(result)
 
