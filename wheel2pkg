@@ -764,7 +764,14 @@ def parseSetupPy(archive, path, raw):
 			continue
 
 		log_verbose("Found line starting with setup")
-		tokenizer = Tokenizer(line[5:], raw, filename = path, lineno = lineno)
+		if line.startswith("setup("):
+			line = line[5:]
+		elif line.startswith("setuptools.setup("):
+			line = line[16:]
+		else:
+			continue
+
+		tokenizer = Tokenizer(line, raw, filename = path, lineno = lineno)
 
 		(token, value) = tokenizer.next()
 		if token != Tokenizer.PUNCT or value != '(':
@@ -1176,7 +1183,7 @@ def obsCreatePackage(pipName):
 	elif wheelArchive.endswith(".tar.gz"):
 		wheelArchiveBase = wheelArchive[:-7]
 
-		(whlBasename, whlVersion) = wheelArchiveBase.split("-")
+		(whlBasename, whlVersion) = wheelArchiveBase.rsplit("-", 1)
 		if whlBasename != pipName:
 			log_warning("downloaded archive name %s does not match request name %s" % (whlBasename, pipName))
 
