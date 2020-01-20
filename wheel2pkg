@@ -108,7 +108,7 @@ def runShellCommand(cmd):
 def runShellCommandList(cmdList):
 	return runShellCommand("; ".join(cmdList))
 
-def findFiles(basename, suffix = None):
+def findFiles(basename, suffix = None, caseSensitive = True):
 	import os
 
 	result = []
@@ -116,6 +116,10 @@ def findFiles(basename, suffix = None):
 		if d.startswith(basename) and \
 		   (suffix is None or d.endswith(suffix)):
 			result.append(d)
+		elif not caseSensitive:
+			if d.lower().startswith(basename) and \
+			   (suffix is None or d.endswith(suffix)):
+				result.append(d)
 	
 	return result
 
@@ -1153,16 +1157,21 @@ def obsBuildRequirements(pyvers, requires):
 
 	return result
 
-def obsCreatePackage(pipName):
+def obsCreatePackage(pipName, pipRequires):
 
 	print("=== Creating OBS package from %s wheel ===" % pipName)
 	pkgName = pipName
 
-	runShellCommand("pip download --no-deps %s" % pipName)
+	pkgSpec = pipName
+	if pipRequires is not None:
+		pkgSpec += "(%s)" % pipRequires
 
-	l = findFiles(pipName + "-", ".whl")
+	runShellCommand("pip download --no-deps '%s'" % pkgSpec)
+
+	archiveName = pipName.replace("-", "_")
+	l = findFiles(archiveName + "-", ".whl", caseSensitive = False)
 	if not l:
-		l = findFiles(pipName + "-", ".tar.gz")
+		l = findFiles(archiveName + "-", ".tar.gz", caseSensitive = False)
 	if not l:
 		log_fatal("Cannot find downloaded wheel archive")
 
@@ -1175,8 +1184,8 @@ def obsCreatePackage(pipName):
 		wheelArchiveBase = wheelArchive[:-4]
 
 		(whlBasename, whlVersion, whlCompatPy, whlCompatApi, whlCompatPlatform) = wheelArchiveBase.split("-")
-		if whlBasename != pipName:
-			log_warning("downloaded archive name %s does not match request name %s" % (whlBasename, pipName))
+		if whlBasename != archiveName:
+			log_warning("downloaded archive name %s does not match request name %s" % (whlBasename, archiveName))
 
 		(path_METADATA, raw) = wheelReadFile(wheelArchive, "METADATA")
 		metadata = parseWheelMetadata(wheelArchive, path_METADATA, raw)
@@ -1184,8 +1193,8 @@ def obsCreatePackage(pipName):
 		wheelArchiveBase = wheelArchive[:-7]
 
 		(whlBasename, whlVersion) = wheelArchiveBase.rsplit("-", 1)
-		if whlBasename != pipName:
-			log_warning("downloaded archive name %s does not match request name %s" % (whlBasename, pipName))
+		if whlBasename != archiveName:
+			log_warning("downloaded archive name %s does not match request name %s" % (whlBasename, archiveName))
 
 		(path_setup, raw) = tarballReadFile(wheelArchive, "setup.py")
 		metadata = parseSetupPy(wheelArchive, path_setup, raw)
@@ -1237,25 +1246,28 @@ def main():
 	global Global_BuildRoot
 
 	try:
-		opts, args = getopt.getopt(sys.argv[1:], "hv", ["help", "verbose"])
+		opts, args = getopt.getopt(sys.argv[1:], "hv", ["help", "verbose", "require="])
 	except getopt.GetoptError as err:
 		# print help information and exit:
 		print (str(err))
 		usage()
 		sys.exit(2)
 
+	opt_require = None
 	for o, a in opts:
 		if o in ("-h", "--help"):
 			usage()
 			sys.exit()
 		if o in ("-v", "--verbose"):
 			opt_verbose += 1
+		if o in ("-r", "--require"):
+			opt_require = a
 
 	Global_BuildRoot = shellExpansion(Global_BuildRoot)
 	log_verbose("Build root is %s" % Global_BuildRoot)
 
 	for name in args:
-		obsCreatePackage(name)
+		obsCreatePackage(name, opt_require)
 
 
 if __name__ == "__main__":
