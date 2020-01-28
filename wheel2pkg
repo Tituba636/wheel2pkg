@@ -123,6 +123,20 @@ def findFiles(basename, suffix = None, caseSensitive = True):
 	
 	return result
 
+def searchPath(filename, pathList):
+	import os
+
+	for dir in pathList:
+		if not dir or dir == ".":
+			path = filename
+		else:
+			path = shellExpansion(dir) + "/" + filename
+
+		if os.path.exists(path):
+			return path
+
+	return None
+
 def ignoreFilesMatching(fileList, testFunc):
 	i = 0
 	while i < len(fileList):
@@ -1052,9 +1066,13 @@ def obsCreateSpecfile(pkgDir, specFileName, binaryPkgName, archiveName, manifest
 		if pyvers not in metadata['python-versions']:
 			skip += "%%define skip_%s 1\n" % pyvers
 
-	template = open("template/specfile")
-	if not template:
+	templatePath = searchPath("template/specfile", [".", "$HOME/lib"])
+	if not templatePath:
 		log_fatal("Cannot file template/specfile")
+
+	template = open(templatePath)
+	if not template:
+		log_fatal("Unable to open %s" % templatePath)
 
 	requires = []
 	for req in pyRequires:

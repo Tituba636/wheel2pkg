@@ -1,0 +1,88 @@
+#
+# spec file for package python-@@PIP_NAME@@
+#
+# Copyright (c) 2020 SUSE LINUX GmbH, Nuernberg, Germany.
+#
+# All modifications and additions to the file contributed by third parties
+# remain the property of their copyright owners, unless otherwise agreed
+# upon. The license for this file, and modifications and additions to the
+# file, is the same license as for the pristine package itself (unless the
+# license for the pristine package is not an Open Source License, in which
+# case the license is the MIT License). An "Open Source License" is a
+# license that conforms to the Open Source Definition (Version 1.9)
+# published by the Open Source Initiative.
+
+# Please submit bugfixes or comments via https://bugs.opensuse.org/
+#
+
+
+%define pipName @@PIP_NAME@@
+%define pipArchiveName @@PIP_ARCHIVE_NAME@@
+@@PIP_SKIP@@
+
+Name:		python-%{pipName}
+Version:	@@PIP_VERSION@@
+Release:	0
+URL:		@@PIP_URL@@
+Summary:	Python: @@PIP_SUMMARY@@
+License:	@@PIP_LICENSE@@
+Group:		Development/Languages/Python
+@@PIP_REQUIRES@@
+
+Source:		%{pipArchiveName}-%{version}-@@PIP_PYTHON_TAGS@@-none-any.whl
+
+BuildRequires:	fdupes
+BuildRequires:	python-rpm-macros
+BuildRequires:	python2-pip
+BuildRequires:	python3-pip
+
+BuildRoot:	%{_tmppath}/%{name}-%{version}-build
+BuildArch:	noarch
+%python_subpackages
+
+
+%description
+@@PIP_DESCRIPTION@@
+
+%prep
+# nothing
+
+%build
+mkdir simple
+cat >simple/index.html <<EOF
+<html><head><title>Simple Index</title><meta name='api-version' value='2' /></head><body>
+<a href='%{pipName}/'>%{pipName}</a><br />
+</body></html>
+EOF
+
+mkdir simple/%{pipName}
+cp -v %{S:0} simple/%{pipName}
+archive=$(basename %{S:0})
+
+cat >simple/%{pipName}/index.html <<EOF
+<a href='$archive'>$archive</a><br />
+EOF
+
+%install
+pip2 install --no-deps --index-url=file://$(pwd)/simple/ --root %{buildroot} %{pipName}
+pip3 install --no-deps --index-url=file://$(pwd)/simple/ --root %{buildroot} %{pipName}
+
+find %{buildroot}/usr/lib* -name \*.py | while read file; do
+    if grep -qs '^#! *%{_bindir}/env' $file; then
+	echo "Removing #!/usr/bin/env from $file"
+	orig=$file.orig
+	ln $file $orig
+    	sed -i 's|^#! *%{_bindir}/env .*$||g' $file
+	touch --reference $orig $file
+	rm -f $orig
+    fi
+done
+
+%python_expand %fdupes %{buildroot}%{$python_sitelib}
+
+
+%files %{python_files}
+%defattr(-,root,root)
+%{python_sitelib}
+
+%changelog
