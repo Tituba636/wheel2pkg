@@ -748,6 +748,8 @@ def tryParseSimpleAssignment(variableDict, line):
 		return
 
 def parseSetupPy(archive, path, raw):
+	global Global_PythonVersion
+
 	log_info("Parsing %s" % (path))
 	result = newMetadata()
 
@@ -806,6 +808,9 @@ def parseSetupPy(archive, path, raw):
 			else:
 				processPythonPackageAttr(result, keyword, literal)
 
+		if not result['python-versions']:
+			result['python-versions'] = sorted(Global_PythonVersion.keys())
+
 		return result
 
 	log_fatal("Unable to locate setup() call in %s" % path)
@@ -816,6 +821,7 @@ Global_SpdxIds = {
 	'MIT'			: 'MIT',
 	'MITLicense'		: 'MIT',
 	'ApacheLicense2.0'	: 'Apache-2.0',
+	'Apache2.0'		: 'Apache-2.0',
 	'ISCLicense'		: 'ISC',
 	'ISClicense'		: 'ISC',
 	'ISCLicense(ISCL)'	: 'ISC',
@@ -863,6 +869,18 @@ def massageMetadata(pkgName, meta):
 		# our rpmlint considers a summary that ends in a '.' an error.
 		# would you believe it.
 		meta['summary'] = meta['summary'].rstrip('.')
+
+	pyTags = {
+		'py2' : 'python2',
+		'py3' : 'python3',
+	}
+	supportedPyTags = []
+	for tag in sorted(pyTags.keys()):
+		if pyTags[tag] in meta['python-versions']:
+			supportedPyTags.append(tag)
+	if not supportedPyTags:
+		log_fatal("unable to determine list of supported py tags")
+	meta['python_tags'] = ".".join(supportedPyTags)
 
 def walkTree(root):
 	import os
@@ -935,9 +953,20 @@ def pipInstall(pipName, pythonVersion = None):
 
 	treeBefore = walkTree(Global_BuildRoot)
 
+	genericOptions = [
+		"--disable-pip-version-check",
+	]
+	installOptions = [
+		"--no-deps",
+		"--only-binary :all:"
+	]
+
 	runShellCommandList((
 			". %s/bin/activate" % Global_BuildRoot,
-			"pip --disable-pip-version-check install --no-deps %s" % pipName
+			"pip %s install %s %s" % (
+				" ".join(genericOptions),
+				" ".join(installOptions),
+				pipName)
 			))
 
 	treeAfter = walkTree(Global_BuildRoot)
@@ -979,34 +1008,18 @@ def obsCreatePkgDirectory(pkgName):
 		if not os.path.isdir(pkgDirectory):
 			log_fatal("%s exists, but is not a directory" % pkgDirectory)
 
-		for pyvers in Global_PkgPrefix.keys():
-			if pyvers == "source":
-				continue
-
-			specfilePath = "%s/%s-%s.spec" % (pkgDirectory, Global_PkgPrefix[pyvers], pkgName)
-			if os.path.exists(specfilePath):
-				log_warning("%s exists and seems to contain a spec file for %s - proceed with caution" % (pkgDirectory, pyvers))
+		specfilePath = "%s/python-%s.spec" % (pkgDirectory, pkgName)
+		if os.path.exists(specfilePath):
+			log_warning("%s exists and seems to contain a spec file - proceed with caution" % (pkgDirectory, ))
 	else:
-		os.makedirs(pkgDirectory)
+		runShellCommand("osc mkpac %s" % pkgDirectory)
+		# os.makedirs(pkgDirectory)
 
 	log_info("OBS package will be prepared in %s" % pkgDirectory)
 	return pkgDirectory
 
-def obsCreateArchive(pkgDir, pkgName, pkgVersion, files):
-	global Global_BuildRoot
-
-	archiveName = "%s/%s-%s.tar.bz2" % (pkgDir, pkgName, pkgVersion)
-
-	writeFileList("FILES", files, makeRelative = True)
-
-	log_info("Creating archive file %s" % archiveName)
-	runShellCommand("tar -C %s -T FILES --owner root --group root -cvjf %s" % (
-				Global_BuildRoot, archiveName
-				))
-
-	removeFile("FILES")
-
-	return archiveName
+def obsCopyArchive(pkgDir, archiveName):
+	runShellCommand("cp %s %s/%s" % (archiveName, pkgDir, archiveName))
 
 def obsCreateManifest(pkgDir, pkgName, pkgVersion, files):
 	global Global_InstallRoot
@@ -1029,51 +1042,35 @@ def obsCreateManifest(pkgDir, pkgName, pkgVersion, files):
 	return manifestName
 
 
-Specfile_Template = """
-Name:			@@PKG_NAME_BINARY@@
-Version:		@@PKG_VERSION@@
-Release:		0
-URL:			@@PKG_URL@@
-Summary:		Python: @@PKG_SUMMARY@@
-License:		@@PKG_LICENSE@@
-Group:			Development/Languages/Python
-@@PKG_REQUIRES@@
-
-BuildArch:		noarch
-
-Source:			@@PKG_ARCHIVE@@
-Source1:		@@PKG_MANIFEST@@
-
-%description
-@@PKG_DESCRIPTION@@
-
-%prep
-%build
-
-%install
-cd $RPM_BUILD_ROOT || exit 1
-mkdir -p usr
-tar -C usr -xjf %{S:0}
-
-%files -f %{S:1}
-%defattr(-,root,root)
-
-%changelog
-"""
-
 def obsCreateSpecfile(pkgDir, specFileName, binaryPkgName, archiveName, manifestName, pyRequires, metadata):
 	global Specfile_Template
+	global Global_PythonVersion
 	import re, os
+
+	skip = ""
+	for pyvers in Global_PythonVersion.keys():
+		if pyvers not in metadata['python-versions']:
+			skip += "%%define skip_%s 1\n" % pyvers
+
+	template = open("template/specfile")
+	if not template:
+		log_fatal("Cannot file template/specfile")
 
 	requires = []
 	for req in pyRequires:
-		requires.append("Requires:               %s" % req)
+		requires.append("Requires:\t%s" % req)
 
 	specfilePath = "%s/%s" % (pkgDir, specFileName)
 	specf = open(specfilePath, "w")
 
-	rx = re.compile("@@PKG_([^@]*)@@")
-	for line in Specfile_Template.splitlines():
+	rx = re.compile("@@PIP_([^@]*)@@")
+	for line in template.readlines():
+		line = line.rstrip()
+		if line == "@@PIP_SKIP@@":
+			if skip:
+				specf.write(skip + "\n")
+			continue
+
 		outline = ""
 		while True:
 			m = rx.search(line)
@@ -1086,11 +1083,7 @@ def obsCreateSpecfile(pkgDir, specFileName, binaryPkgName, archiveName, manifest
 
 			key = m.group(1).lower()
 
-			if key == "archive":
-				value = os.path.basename(archiveName)
-			elif key == "manifest":
-				value = os.path.basename(manifestName)
-			elif key == "requires":
+			if key == "requires":
 				value = "\n".join(requires)
 			elif key == "description":
 				value = metadata.get('summary')
@@ -1102,6 +1095,14 @@ def obsCreateSpecfile(pkgDir, specFileName, binaryPkgName, archiveName, manifest
 					email = metadata.get('author-email')
 					if email:
 						value += " (" + email + ")"
+			elif key == "archive_name":
+				name = metadata['name']
+				if archiveName is not None:
+					value = archiveName
+				else:
+					value = name.replace("-", "_")
+				if name == value:
+					value = "%{pipName}"
 			elif key == "name_binary":
 				value = binaryPkgName
 			else:
@@ -1157,7 +1158,24 @@ def obsBuildRequirements(pyvers, requires):
 
 	return result
 
-def obsCreatePackage(pipName, pipRequires):
+def pipFindArchive(archiveName):
+	log_debug("See if there's a %s-*.whl file" % archiveName)
+	l = findFiles(archiveName + "-", ".whl", caseSensitive = False)
+	if not l:
+		log_debug("See if there's a %s-*.tar.gz file" % archiveName)
+		l = findFiles(archiveName + "-", ".tar.gz", caseSensitive = False)
+	if not l:
+		log_debug("No match")
+		return None
+
+	if len(l) > 1:
+		log_error("Found archive files: %s" % ", ".join(l))
+		log_fatal("Found more than one pip archive; don't know how to proceed")
+
+	log_verbose("Found PIP archive %s" % l[0])
+	return l[0]
+
+def obsCreatePackage(pipName, archiveName, pipRequires):
 
 	print("=== Creating OBS package from %s wheel ===" % pipName)
 	pkgName = pipName
@@ -1166,20 +1184,19 @@ def obsCreatePackage(pipName, pipRequires):
 	if pipRequires is not None:
 		pkgSpec += "(%s)" % pipRequires
 
-	runShellCommand("pip download --no-deps '%s'" % pkgSpec)
+	if archiveName is None:
+		archiveName = pipName.replace("-", "_")
 
-	archiveName = pipName.replace("-", "_")
-	l = findFiles(archiveName + "-", ".whl", caseSensitive = False)
-	if not l:
-		l = findFiles(archiveName + "-", ".tar.gz", caseSensitive = False)
-	if not l:
-		log_fatal("Cannot find downloaded wheel archive")
+	wheelArchive = pipFindArchive(archiveName)
+	if wheelArchive is None:
+		log_verbose("%s: no archive file found, downloading now" % pipName)
+		runShellCommand("pip download --no-deps '%s'" % pkgSpec)
 
-	if len(l) > 1:
-		log_error("Found archive files: %s" % ", ".join(l))
-		log_fatal("Found more than one wheel archive; don't know how to proceed")
+		wheelArchive = pipFindArchive(archiveName)
 
-	wheelArchive = l[0]
+		if wheelArchive is None:
+			log_fatal("Cannot find downloaded pip archive")
+
 	if wheelArchive.endswith(".whl"):
 		wheelArchiveBase = wheelArchive[:-4]
 
@@ -1211,32 +1228,17 @@ def obsCreatePackage(pipName, pipRequires):
 
 	pkgDir = obsCreatePkgDirectory(pkgName)
 
-	pkgVersion = metadata['version']
-	for pyvers in metadata['python-versions']:
-		global Global_PkgPrefix, Global_PythonVersion
+	sourcePkgName = "python-%s" % (pkgName, )
+	specfileName = "%s.spec" % sourcePkgName
+	specFilePath = obsCreateSpecfile(pkgDir, specfileName, sourcePkgName,
+		       archiveName, None,
+		       metadata['requires'], # obsBuildRequirements(pyvers, metadata['requires']),
+		       metadata)
 
-		files = pipInstall(pkgName, pyvers)
+	obsCopyArchive(pkgDir, wheelArchive)
 
-		pkgPrefix = Global_PkgPrefix[pyvers]
-		binaryPkgName = "%s-%s" % (pkgPrefix, pkgName)
-		specfileName = "%s.spec" % binaryPkgName
-
-		archiveName = obsCreateArchive(pkgDir, binaryPkgName, pkgVersion, files)
-
-		# rpmlint wants these to be called out explicitly in the rpm %files list
-		v = Global_PythonVersion[pyvers]
-		extraFiles = [
-			"/lib/python%s/" % v,
-			"/lib/python%s/site-packages/" % v,
-			     ]
-		manifestName = obsCreateManifest(pkgDir, binaryPkgName, pkgVersion, extraFiles + files)
-
-		specFilePath = obsCreateSpecfile(pkgDir, specfileName, binaryPkgName,
-			       archiveName, manifestName,
-			       obsBuildRequirements(pyvers, metadata['requires']),
-			       metadata)
-
-		obsCreateChangesFile(pkgDir, binaryPkgName, pkgVersion)
+	runShellCommand("cd %s && test -f *.changes || osc vc -m\"Initial build of version %s\"" % (pkgDir, metadata['version']))
+	runShellCommand("cd %s && osc ar" % pkgDir)
 
 	log_info("Done.")
 
@@ -1246,7 +1248,7 @@ def main():
 	global Global_BuildRoot
 
 	try:
-		opts, args = getopt.getopt(sys.argv[1:], "hv", ["help", "verbose", "require="])
+		opts, args = getopt.getopt(sys.argv[1:], "A:hR:v", ["archive-name=", "help", "verbose", "require="])
 	except getopt.GetoptError as err:
 		# print help information and exit:
 		print (str(err))
@@ -1254,20 +1256,23 @@ def main():
 		sys.exit(2)
 
 	opt_require = None
+	opt_archive = None
 	for o, a in opts:
 		if o in ("-h", "--help"):
 			usage()
 			sys.exit()
 		if o in ("-v", "--verbose"):
 			opt_verbose += 1
-		if o in ("-r", "--require"):
+		if o in ("-R", "--require"):
 			opt_require = a
+		if o in ("-A", "--archive-name"):
+			opt_archive = a
 
 	Global_BuildRoot = shellExpansion(Global_BuildRoot)
 	log_verbose("Build root is %s" % Global_BuildRoot)
 
 	for name in args:
-		obsCreatePackage(name, opt_require)
+		obsCreatePackage(name, opt_archive, opt_require)
 
 
 if __name__ == "__main__":
